@@ -4,6 +4,12 @@ package sequential
 
 import "os"
 
+// openFileSequential is an alias for [os.OpenFile] on non-Windows platforms.
+// It is shared by the thin wrappers below and [NewFile].
+func openFileSequential(name string, flag int, perm os.FileMode) (*os.File, error) {
+	return os.OpenFile(name, flag, perm)
+}
+
 // Create is an alias for [os.Create] on non-Windows platforms.
 func Create(name string) (*os.File, error) {
 	return os.Create(name)
@@ -16,7 +22,7 @@ func Open(name string) (*os.File, error) {
 
 // OpenFile is an alias for [os.OpenFile] on non-Windows platforms.
 func OpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
-	return os.OpenFile(name, flag, perm)
+	return openFileSequential(name, flag, perm)
 }
 
 // CreateTemp is an alias for [os.CreateTemp] on non-Windows platforms.

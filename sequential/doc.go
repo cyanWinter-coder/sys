@@ -12,4 +12,15 @@
 // For non-Windows platforms, the package provides wrappers for the equivalents
 // in the os packages. They are passthrough on Unix platforms, and only relevant
 // on Windows.
+//
+// # Versioned files
+//
+// Beyond the thin os wrappers, [NewFile] returns a [File]: a concurrency-safe
+// wrapper that freezes the identity (version) of the opened file and chains
+// resource ownership and write-barrier cleanup into a single state machine.
+// A handle keeps serving the incarnation it opened even if the path is
+// meanwhile replaced or removed, short writes are retried until the full
+// buffer lands, write or sync failures poison later writes, and Close drives
+// the underlying handle to a unique terminal state. The wrapper and its
+// error shapes are identical on Windows and Unix.
 package sequential
