@@ -11,6 +11,10 @@ package userns
 // RunningInUserNS detects whether we are currently running in a Linux
 // user namespace and memoizes the result. It returns false on non-Linux
 // platforms.
+//
+// On non-Linux platforms there is no user namespace to observe; use
+// [Supported] to tell this "not applicable" case apart from "not in a user
+// namespace".
 func RunningInUserNS() bool {
 	return inUserNS()
 }

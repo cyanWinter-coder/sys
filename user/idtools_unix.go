@@ -115,10 +115,17 @@ func LoadIdentityMapping(name string) (IdentityMapping, error) {
 		return IdentityMapping{}, err
 	}
 
-	return IdentityMapping{
+	m := IdentityMapping{
 		UIDMaps: subuidRanges,
 		GIDMaps: subgidRanges,
-	}, nil
+	}
+	// The subordinate ID files are outside our control; reject ranges that
+	// overlap or exceed the 32-bit ID space instead of handing out a mapping
+	// whose conversions depend on entry order.
+	if err := m.Validate(); err != nil {
+		return IdentityMapping{}, fmt.Errorf("invalid subordinate ID ranges for user %q: %w", usr.Name, err)
+	}
+	return m, nil
 }
 
 func lookupSubRangesFile(path string, usr User) ([]IDMap, error) {
@@ -137,12 +144,20 @@ func lookupSubRangesFile(path string, usr User) ([]IDMap, error) {
 
 	var containerID int64
 	for _, idrange := range rangeList {
+		// A zero-length range is valid in /etc/subuid but cannot be written
+		// to the kernel's uid_map, where count must be positive.
+		if idrange.Count == 0 {
+			continue
+		}
 		idMap = append(idMap, IDMap{
 			ID:       containerID,
 			ParentID: idrange.SubID,
 			Count:    idrange.Count,
 		})
 		containerID = containerID + idrange.Count
+	}
+	if len(idMap) == 0 {
+		return nil, fmt.Errorf("no non-empty subuid ranges found for user %q", usr.Name)
 	}
 	return idMap, nil
 }

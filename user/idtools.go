@@ -2,6 +2,7 @@ package user
 
 import (
 	"fmt"
+	"math"
 	"os"
 )
 
@@ -62,35 +63,68 @@ func getRootUIDGID(uidMap, gidMap []IDMap) (int, int, error) {
 }
 
 // toContainer takes an id mapping, and uses it to translate a
-// host ID to the remapped ID. If no map is provided, then the translation
-// assumes a 1-to-1 mapping and returns the passed in id
+// host ID to the remapped ID. If no map is provided (nil or empty), then the
+// translation assumes a 1-to-1 mapping and returns the passed in id
 func toContainer(hostID int, idMap []IDMap) (int, error) {
-	if idMap == nil {
+	if len(idMap) == 0 {
 		return hostID, nil
 	}
-	for _, m := range idMap {
-		if (int64(hostID) >= m.ParentID) && (int64(hostID) <= (m.ParentID + m.Count - 1)) {
-			contID := int(m.ID + (int64(hostID) - m.ParentID))
-			return contID, nil
-		}
+	contID, ok := lookupContainer(int64(hostID), idMap)
+	if !ok {
+		return -1, fmt.Errorf("host ID %d cannot be mapped to a container ID", hostID)
 	}
-	return -1, fmt.Errorf("host ID %d cannot be mapped to a container ID", hostID)
+	if contID > math.MaxInt {
+		return -1, fmt.Errorf("host ID %d maps to container ID %d, which does not fit in int", hostID, contID)
+	}
+	return int(contID), nil
 }
 
 // toHost takes an id mapping and a remapped ID, and translates the
-// ID to the mapped host ID. If no map is provided, then the translation
-// assumes a 1-to-1 mapping and returns the passed in id #
+// ID to the mapped host ID. If no map is provided (nil or empty), then the
+// translation assumes a 1-to-1 mapping and returns the passed in id #
 func toHost(contID int, idMap []IDMap) (int, error) {
-	if idMap == nil {
+	if len(idMap) == 0 {
 		return contID, nil
 	}
+	hostID, ok := lookupHost(int64(contID), idMap)
+	if !ok {
+		return -1, fmt.Errorf("container ID %d cannot be mapped to a host ID", contID)
+	}
+	if hostID > math.MaxInt {
+		return -1, fmt.Errorf("container ID %d maps to host ID %d, which does not fit in int", contID, hostID)
+	}
+	return int(hostID), nil
+}
+
+// lookupHost finds the host ID mapped to contID. It reports false when no
+// entry covers contID. Entries are scanned in order and the first match wins,
+// which preserves the historical behavior for mappings that were not passed
+// through [ValidateIDMaps]; validated mappings have ordered, non-overlapping
+// container ranges, so there is at most one match.
+func lookupHost(contID int64, idMap []IDMap) (int64, bool) {
 	for _, m := range idMap {
-		if (int64(contID) >= m.ID) && (int64(contID) <= (m.ID + m.Count - 1)) {
-			hostID := int(m.ParentID + (int64(contID) - m.ID))
-			return hostID, nil
+		// Compare the offset rather than start+count so an unvalidated entry
+		// with a huge count cannot overflow.
+		if contID >= m.ID && contID-m.ID < m.Count {
+			return m.ParentID + (contID - m.ID), true
 		}
 	}
-	return -1, fmt.Errorf("container ID %d cannot be mapped to a host ID", contID)
+	return 0, false
+}
+
+// lookupContainer finds the container ID mapped to hostID. It reports false
+// when no entry covers hostID. Host ranges are assumed to be non-overlapping,
+// as enforced by [ValidateIDMaps], so at most one entry can match; they are
+// not required to be ordered.
+func lookupContainer(hostID int64, idMap []IDMap) (int64, bool) {
+	for _, m := range idMap {
+		// Compare the offset rather than start+count so an unvalidated entry
+		// with a huge count cannot overflow.
+		if hostID >= m.ParentID && hostID-m.ParentID < m.Count {
+			return m.ID + (hostID - m.ParentID), true
+		}
+	}
+	return 0, false
 }
 
 // IdentityMapping contains a mappings of UIDs and GIDs.
@@ -103,14 +137,32 @@ type IdentityMapping struct {
 // RootPair returns a uid and gid pair for the root user. The error is ignored
 // because a root user always exists, and the defaults are correct when the uid
 // and gid maps are empty.
+//
+// If either mapping is malformed, RootPair returns the pair -1, -1 rather than
+// deriving ownership from an ambiguous range. Use [IdentityMapping.Validate]
+// (or [ValidateIdentityMapping]) to obtain a detailed error.
 func (i IdentityMapping) RootPair() (int, int) {
+	if err := i.Validate(); err != nil {
+		return -1, -1
+	}
 	uid, gid, _ := getRootUIDGID(i.UIDMaps, i.GIDMaps)
 	return uid, gid
 }
 
 // ToHost returns the host UID and GID for the container uid and gid.
 // An empty mapping is treated as identity.
+//
+// The mapping is validated before it is used, so a malformed mapping (entries
+// that are unordered, overlap, or do not fit in the 32-bit ID space) is
+// rejected with an [*IDMapError] instead of producing a result that depends on
+// which conflicting entry happens to come first.
+//
+// To validate once and reuse a single immutable snapshot for many conversions,
+// use [ValidateIdentityMapping] and [ValidatedIdentityMapping.ToHost].
 func (i IdentityMapping) ToHost(uid, gid int) (int, int, error) {
+	if err := i.Validate(); err != nil {
+		return -1, -1, err
+	}
 	ruid, err := toHost(uid, i.UIDMaps)
 	if err != nil {
 		return -1, -1, err
@@ -119,8 +171,14 @@ func (i IdentityMapping) ToHost(uid, gid int) (int, int, error) {
 	return ruid, rgid, err
 }
 
-// ToContainer returns the container UID and GID for the host uid and gid
+// ToContainer returns the container UID and GID for the host uid and gid.
+//
+// The mapping is validated before it is used; see [IdentityMapping.ToHost]
+// for details.
 func (i IdentityMapping) ToContainer(uid, gid int) (int, int, error) {
+	if err := i.Validate(); err != nil {
+		return -1, -1, err
+	}
 	ruid, err := toContainer(uid, i.UIDMaps)
 	if err != nil {
 		return -1, -1, err
