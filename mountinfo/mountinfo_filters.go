@@ -14,6 +14,29 @@ import "strings"
 // stop: true if parsing should be stopped after the entry.
 type FilterFunc func(*Info) (skip, stop bool)
 
+// applyFilter runs filter against a fully parsed snapshot of the mount
+// table and returns the entries that were not skipped. It is shared by
+// all platform-specific parsers, which guarantees that filtering always
+// happens on one consistent snapshot instead of on partially parsed
+// state. A nil filter returns the snapshot unchanged.
+func applyFilter(infos []*Info, filter FilterFunc) []*Info {
+	if filter == nil {
+		return infos
+	}
+	out := make([]*Info, 0, len(infos))
+	for _, info := range infos {
+		skip, stop := filter(info)
+		if skip {
+			continue
+		}
+		out = append(out, info)
+		if stop {
+			break
+		}
+	}
+	return out
+}
+
 // PrefixFilter discards all entries whose mount points do not start with, or
 // are equal to the path specified in prefix. The prefix path must be absolute,
 // have all symlinks resolved, and cleaned (i.e. no extra slashes or dots).

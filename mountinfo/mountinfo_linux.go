@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
 )
@@ -19,10 +20,15 @@ import (
 // that provide fake mountinfo data, or when a source other
 // than /proc/thread-self/mountinfo needs to be read from.
 //
+// The whole input is parsed into a consistent snapshot before the
+// filter is applied, so a single call never mixes entries from
+// different versions of the mount table, and malformed entries are
+// reported regardless of the filter stop semantics.
+//
 // This function is Linux-specific.
 func GetMountsFromReader(r io.Reader, filter FilterFunc) ([]*Info, error) {
 	s := bufio.NewScanner(r)
-	out := []*Info{}
+	infos := make([]*Info, 0)
 	for s.Scan() {
 		/*
 		   See http://man7.org/linux/man-pages/man5/proc.5.html
@@ -48,68 +54,89 @@ func GetMountsFromReader(r io.Reader, filter FilterFunc) ([]*Info, error) {
 		    * a separator field		(8)
 		    * 3 mandatory fields	(9)..(11)
 		*/
-
-		text := s.Text()
-		fields := strings.Split(text, " ")
-		numFields := len(fields)
-		if numFields < 10 {
-			// should be at least 10 fields
-			return nil, fmt.Errorf("parsing '%s' failed: not enough fields (%d)", text, numFields)
+		info, err := parseInfoLine(s.Text())
+		if err != nil {
+			return nil, err
 		}
-
-		// separator field
-		sepIdx := numFields - 4
-		// In Linux <= 3.9 mounting a cifs with spaces in a share
-		// name (like "//srv/My Docs") _may_ end up having a space
-		// in the last field of mountinfo (like "unc=//serv/My Docs").
-		// Since kernel 3.10-rc1, cifs option "unc=" is ignored,
-		// so spaces should not appear.
-		//
-		// Check for a separator, and work around the spaces bug
-		for fields[sepIdx] != "-" {
-			sepIdx--
-			if sepIdx == 5 {
-				return nil, fmt.Errorf("parsing '%s' failed: missing - separator", text)
-			}
-		}
-
-		major, minor, ok := strings.Cut(fields[2], ":")
-		if !ok {
-			return nil, fmt.Errorf("parsing '%s' failed: unexpected major:minor pair %s", text, fields[2])
-		}
-
-		p := &Info{
-			ID:         toInt(fields[0]),
-			Parent:     toInt(fields[1]),
-			Major:      toInt(major),
-			Minor:      toInt(minor),
-			Root:       unescape(fields[3]),
-			Mountpoint: unescape(fields[4]),
-			Options:    fields[5],
-			Optional:   strings.Join(fields[6:sepIdx], " "), // zero or more optional fields
-			FSType:     unescape(fields[sepIdx+1]),
-			Source:     unescape(fields[sepIdx+2]),
-			VFSOptions: fields[sepIdx+3],
-		}
-
-		// Run the filter after parsing all fields.
-		var skip, stop bool
-		if filter != nil {
-			skip, stop = filter(p)
-			if skip {
-				continue
-			}
-		}
-
-		out = append(out, p)
-		if stop {
-			break
-		}
+		infos = append(infos, info)
 	}
 	if err := s.Err(); err != nil {
 		return nil, err
 	}
-	return out, nil
+
+	// Apply the filter to the complete snapshot only.
+	return applyFilter(infos, filter), nil
+}
+
+// parseInfoLine parses a single line of /proc/self/mountinfo. All
+// mandatory fields are validated, and a parse error is returned if any
+// of them is missing or malformed. The optional fields (7) are joined
+// verbatim, so unknown or future optional tags are preserved as-is and
+// do not cause an error.
+func parseInfoLine(text string) (*Info, error) {
+	fields := strings.Split(text, " ")
+	numFields := len(fields)
+	if numFields < 10 {
+		// should be at least 10 fields
+		return nil, fmt.Errorf("parsing '%s' failed: not enough fields (%d)", text, numFields)
+	}
+
+	// separator field
+	sepIdx := numFields - 4
+	// In Linux <= 3.9 mounting a cifs with spaces in a share
+	// name (like "//srv/My Docs") _may_ end up having a space
+	// in the last field of mountinfo (like "unc=//serv/My Docs").
+	// Since kernel 3.10-rc1, cifs option "unc=" is ignored,
+	// so spaces should not appear.
+	//
+	// Check for a separator, and work around the spaces bug
+	for fields[sepIdx] != "-" {
+		sepIdx--
+		if sepIdx == 5 {
+			return nil, fmt.Errorf("parsing '%s' failed: missing - separator", text)
+		}
+	}
+
+	id, err := strconv.Atoi(fields[0])
+	if err != nil {
+		return nil, fmt.Errorf("parsing '%s' failed: invalid mount ID %q: %w", text, fields[0], err)
+	}
+	parent, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return nil, fmt.Errorf("parsing '%s' failed: invalid parent ID %q: %w", text, fields[1], err)
+	}
+
+	// The device number uses the same escaping rules as root and
+	// mount point; unescape before splitting it into major and minor.
+	major, minor, ok := strings.Cut(unescape(fields[2]), ":")
+	if !ok {
+		return nil, fmt.Errorf("parsing '%s' failed: unexpected major:minor pair %s", text, fields[2])
+	}
+	majorNum, err := strconv.Atoi(major)
+	if err != nil {
+		return nil, fmt.Errorf("parsing '%s' failed: invalid major number %q: %w", text, major, err)
+	}
+	minorNum, err := strconv.Atoi(minor)
+	if err != nil {
+		return nil, fmt.Errorf("parsing '%s' failed: invalid minor number %q: %w", text, minor, err)
+	}
+
+	p := &Info{
+		ID:         id,
+		Parent:     parent,
+		Major:      majorNum,
+		Minor:      minorNum,
+		Root:       unescape(fields[3]),
+		Mountpoint: unescape(fields[4]),
+		Options:    fields[5],
+		// Zero or more optional fields, joined verbatim. Unknown tags
+		// are kept as-is instead of being treated as an error.
+		Optional:   strings.Join(fields[6:sepIdx], " "),
+		FSType:     unescape(fields[sepIdx+1]),
+		Source:     unescape(fields[sepIdx+2]),
+		VFSOptions: fields[sepIdx+3],
+	}
+	return p, nil
 }
 
 var (
@@ -183,7 +210,10 @@ func PidMountInfo(pid int) ([]*Info, error) {
 //	hash (aka #)       -- as \043
 //
 // This function converts all such escape sequences back to ASCII, and returns
-// the unescaped string.
+// the unescaped string. Any malformed or out-of-range escape (a truncated
+// sequence, non-octal digits, or a value above utf8.RuneSelf-1) is left
+// untouched, so the output is always a safe, length-preserving decoding of
+// the input.
 func unescape(path string) string {
 	// Try to avoid copying.
 	if strings.IndexByte(path, '\\') == -1 {
@@ -193,35 +223,32 @@ func unescape(path string) string {
 	// The following code is UTF-8 transparent as it only looks for some
 	// specific characters (backslash and 0..7) with values less than
 	// utf8.RuneSelf, and everything else is passed through as is.
-	buf := make([]byte, len(path))
-	bufLen := 0
+	buf := make([]byte, 0, len(path))
 	for i := 0; i < len(path); i++ {
 		c := path[i]
 		// Look for \NNN, i.e. a backslash followed by three octal
 		// digits. Maximum value is 177 (equals utf8.RuneSelf-1).
 		if c == '\\' && i+3 < len(path) &&
-			(path[i+1] == '0' || path[i+1] == '1') &&
-			(path[i+2] >= '0' && path[i+2] <= '7') &&
-			(path[i+3] >= '0' && path[i+3] <= '7') {
-			// Convert from ASCII to numeric values.
-			c1 := path[i+1] - '0'
-			c2 := path[i+2] - '0'
-			c3 := path[i+3] - '0'
+			isOctalDigit(path[i+1]) &&
+			isOctalDigit(path[i+2]) &&
+			isOctalDigit(path[i+3]) {
 			// Each octal digit is three bits, thus the shift value.
-			c = c1<<6 | c2<<3 | c3
-			// We read three extra bytes of input.
-			i += 3
+			v := int(path[i+1]-'0')<<6 | int(path[i+2]-'0')<<3 | int(path[i+3]-'0')
+			if v < utf8.RuneSelf {
+				buf = append(buf, byte(v))
+				// We read three extra bytes of input.
+				i += 3
+				continue
+			}
 		}
-		buf[bufLen] = c
-		bufLen++
+		// Not a valid in-range escape: copy the byte (including the
+		// backslash) verbatim.
+		buf = append(buf, c)
 	}
 
-	return string(buf[:bufLen])
+	return string(buf)
 }
 
-// toInt converts a string to an int, and ignores any numbers parsing errors,
-// as there should not be any.
-func toInt(s string) int {
-	i, _ := strconv.Atoi(s)
-	return i
+func isOctalDigit(c byte) bool {
+	return c >= '0' && c <= '7'
 }

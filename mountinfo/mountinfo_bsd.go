@@ -17,25 +17,13 @@ func parseMountTable(filter FilterFunc) ([]*Info, error) {
 		return nil, err
 	}
 
-	var out []*Info
-	for _, entry := range entries {
-		var skip, stop bool
-		mountinfo := getMountinfo(&entry)
-
-		if filter != nil {
-			// filter out entries we're not interested in
-			skip, stop = filter(mountinfo)
-			if skip {
-				continue
-			}
-		}
-
-		out = append(out, mountinfo)
-		if stop {
-			break
-		}
+	// Build the complete snapshot first, then apply the filter, so the
+	// same mount table version is used throughout one call.
+	infos := make([]*Info, 0, count)
+	for i := range entries {
+		infos = append(infos, getMountinfo(&entries[i]))
 	}
-	return out, nil
+	return applyFilter(infos, filter), nil
 }
 
 func mounted(path string) (bool, error) {
