@@ -8,7 +8,9 @@
 //
 // A matched entrypoint is analogous to main for that invocation mode: callers
 // typically call Init at the start of main and return immediately when it
-// reports a match.
+// reports a match. [RunEntrypoint] is the equivalent that also terminates the
+// process with a meaningful status, which is what [Start] and [Run] report to
+// the parent.
 //
 // Example uses:
 //
@@ -21,6 +23,16 @@
 // The programmatic re-exec pattern is commonly used as a safe alternative to
 // fork-without-exec in Go, since the runtime is not fork-safe once multiple
 // threads exist (see [os.StartProcess] and https://go.dev/issue/27505).
+//
+// # Child lifecycle
+//
+// [Command] and [CommandContext] return a bare [*exec.Cmd]. For a re-exec that
+// has a well-defined terminal state, use [Start] or [Run] instead: they reject
+// an unregistered or ambiguous argv[0] before starting a process, bound the
+// child's termination and output draining, and publish one immutable [Result]
+// holding the child's real exit code or terminating signal. On the child side,
+// [RunEntrypoint] terminates the process with a status that matches the
+// entrypoint's outcome.
 //
 // Example (multi-call binary):
 //
@@ -71,25 +83,79 @@ package reexec
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
-
-	"github.com/moby/sys/reexec/internal/reexecoverride"
+	"sync"
 )
 
-var entrypoints = make(map[string]func(context.Context) error)
+// Registration and dispatch errors. They are returned by [RegisterEntrypoint],
+// [RegisterAll], [Resolve], and [ResolveInit]; the older [Register] and
+// [RegisterContext] functions panic instead, for compatibility.
+var (
+	// ErrNotRegistered is returned when no entrypoint is registered under the
+	// requested name.
+	ErrNotRegistered = errors.New("reexec: entrypoint not registered")
+	// ErrInvalidName is returned when an entrypoint name is empty or contains a
+	// path component that cannot be reduced to a unique basename.
+	ErrInvalidName = errors.New("reexec: invalid entrypoint name")
+	// ErrAlreadyRegistered is returned when a name is registered more than once.
+	ErrAlreadyRegistered = errors.New("reexec: entrypoint already registered")
+	// ErrNilEntrypoint is returned when a nil entrypoint function is registered.
+	ErrNilEntrypoint = errors.New("reexec: nil entrypoint")
+)
+
+var (
+	// entrypointsMu guards entrypoints. Registration and lookup are safe for
+	// concurrent use; actual registration is expected to happen during
+	// initialization so that the set of entrypoints is stable at dispatch time.
+	entrypointsMu sync.RWMutex
+	entrypoints   = make(map[string]func(context.Context) error)
+)
+
+// Entry is a single name/entrypoint pair for [RegisterAll].
+type Entry struct {
+	// Name is the entrypoint name; it must not contain a path component.
+	Name string
+	// Entrypoint is the function to run. It must not be nil.
+	Entrypoint func(context.Context) error
+}
+
+// Entrypoint is a uniquely resolved entrypoint. The zero value is invalid; use
+// [Resolve] or [ResolveInit] to obtain one.
+type Entrypoint struct {
+	name string
+	run  func(context.Context) error
+}
+
+// Name returns the registered name of the entrypoint.
+func (e Entrypoint) Name() string { return e.name }
+
+// Valid reports whether e refers to a registered entrypoint.
+func (e Entrypoint) Valid() bool { return e.run != nil }
+
+// Run executes the entrypoint with ctx and returns its result.
+//
+// Run on the zero Entrypoint returns an error wrapping [ErrNotRegistered].
+func (e Entrypoint) Run(ctx context.Context) error {
+	if e.run == nil {
+		return fmt.Errorf("%w: zero Entrypoint", ErrNotRegistered)
+	}
+	return e.run(ctx)
+}
 
 // Register associates name with an entrypoint function to be executed when
 // the current binary is invoked with argv[0] equal to name.
 //
 // Register is not safe for concurrent use; entrypoints must be registered
 // during program initialization, before calling [Dispatch] or [Init].
-// It panics if name contains a path component or is already registered.
+// It panics if name is empty or contains a path component, if entrypoint is
+// nil, or if name is already registered. New code should prefer
+// [RegisterEntrypoint], which reports the same problems as errors.
 func Register(name string, entrypoint func()) {
-	registerEntrypoint(name, func(context.Context) error {
+	mustRegister(name, func(context.Context) error {
 		entrypoint()
 		return nil
 	})
@@ -98,22 +164,127 @@ func Register(name string, entrypoint func()) {
 // RegisterContext is like [Register] but the entrypoint receives a context and
 // reports success or failure by returning an error.
 //
-// RegisterContext is not safe for concurrent use; entrypoints must be
-// registered during program initialization, before calling [Dispatch] or [Init].
-// It panics if name contains a path component or is already registered.
+// RegisterContext has the same concurrency and panic behavior as [Register].
+// New code should prefer [RegisterEntrypoint].
 func RegisterContext(name string, entrypoint func(context.Context) error) {
-	registerEntrypoint(name, entrypoint)
+	mustRegister(name, entrypoint)
 }
 
-func registerEntrypoint(name string, entrypoint func(context.Context) error) {
-	if filepath.Base(name) != name {
-		panic(fmt.Sprintf("reexec func does not expect a path component: %q", name))
+// RegisterEntrypoint registers entrypoint under name. Unlike [Register] and
+// [RegisterContext], it returns an error instead of panicking:
+//
+//   - [ErrInvalidName] if name is empty or contains a path component;
+//   - [ErrNilEntrypoint] if entrypoint is nil;
+//   - [ErrAlreadyRegistered] if name is already registered.
+//
+// Registration is atomic: either the name is registered or the registry is
+// left unchanged.
+func RegisterEntrypoint(name string, entrypoint func(context.Context) error) error {
+	return registerEntrypoint(name, entrypoint)
+}
+
+// RegisterAll registers a batch of entrypoints atomically. Every entry is
+// validated (including duplicates within the batch) before any of them is
+// installed, so on error the registry is left exactly as it was and the caller
+// can retry with a corrected batch.
+func RegisterAll(entries ...Entry) error {
+	entrypointsMu.Lock()
+	defer entrypointsMu.Unlock()
+
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if err := validateEntrypoint(entry.Name, entry.Entrypoint); err != nil {
+			return err
+		}
+		if _, ok := seen[entry.Name]; ok {
+			return fmt.Errorf("%w: %q appears more than once in batch", ErrAlreadyRegistered, entry.Name)
+		}
+		if _, ok := entrypoints[entry.Name]; ok {
+			return fmt.Errorf("%w: %q", ErrAlreadyRegistered, entry.Name)
+		}
+		seen[entry.Name] = struct{}{}
 	}
-	if _, exists := entrypoints[name]; exists {
-		panic(fmt.Sprintf("reexec func already registered under name %q", name))
+	for _, entry := range entries {
+		entrypoints[entry.Name] = entry.Entrypoint
+	}
+	return nil
+}
+
+// Resolve resolves name to its unique entrypoint.
+//
+// As with [Dispatch], only the base name of name is considered, so an argv[0]
+// value such as "/usr/bin/reexec-worker" resolves the entrypoint registered as
+// "reexec-worker". If name has no base name (it is empty or a root), or the
+// base name is not registered, Resolve reports a non-nil error wrapping
+// [ErrInvalidName] or [ErrNotRegistered].
+func Resolve(name string) (Entrypoint, error) {
+	base := filepath.Base(name)
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		return Entrypoint{}, fmt.Errorf("%w: %q", ErrInvalidName, name)
 	}
 
+	entrypointsMu.RLock()
+	entrypoint, ok := entrypoints[base]
+	entrypointsMu.RUnlock()
+	if !ok {
+		return Entrypoint{}, fmt.Errorf("%w: %q", ErrNotRegistered, base)
+	}
+	return Entrypoint{name: base, run: entrypoint}, nil
+}
+
+// ResolveInit resolves the entrypoint selected by the current process's
+// argv[0], the same value [Dispatch] and [Init] use.
+//
+// It differs from [Dispatch] in that a process that was not invoked as a
+// registered entrypoint yields an error wrapping [ErrNotRegistered] rather than
+// a silent no-match. If the process has no argv[0] at all (os.Args is empty),
+// ResolveInit returns an error wrapping [ErrInvalidName] instead of panicking.
+func ResolveInit() (Entrypoint, error) {
+	if len(os.Args) == 0 {
+		return Entrypoint{}, fmt.Errorf("%w: process has no argv[0]", ErrInvalidName)
+	}
+	return Resolve(os.Args[0])
+}
+
+// registerEntrypoint installs entrypoint under name, returning an error for an
+// invalid or duplicate registration. It never mutates the registry on error.
+func registerEntrypoint(name string, entrypoint func(context.Context) error) error {
+	if err := validateEntrypoint(name, entrypoint); err != nil {
+		return err
+	}
+
+	entrypointsMu.Lock()
+	defer entrypointsMu.Unlock()
+	if _, exists := entrypoints[name]; exists {
+		return fmt.Errorf("%w: %q", ErrAlreadyRegistered, name)
+	}
 	entrypoints[name] = entrypoint
+	return nil
+}
+
+func validateEntrypoint(name string, entrypoint func(context.Context) error) error {
+	if name == "" || filepath.Base(name) != name {
+		return fmt.Errorf("%w: %q", ErrInvalidName, name)
+	}
+	if entrypoint == nil {
+		return fmt.Errorf("%w: %q", ErrNilEntrypoint, name)
+	}
+	return nil
+}
+
+// mustRegister is the legacy panic-based wrapper used by Register and
+// RegisterContext.
+func mustRegister(name string, entrypoint func(context.Context) error) {
+	if err := registerEntrypoint(name, entrypoint); err != nil {
+		switch {
+		case errors.Is(err, ErrInvalidName):
+			panic(fmt.Sprintf("reexec func does not expect a path component: %q", name))
+		case errors.Is(err, ErrAlreadyRegistered):
+			panic(fmt.Sprintf("reexec func already registered under name %q", name))
+		default:
+			panic(err)
+		}
+	}
 }
 
 // Dispatch checks whether the current process was invoked under a registered
@@ -144,12 +315,60 @@ func Init() bool {
 	return ok
 }
 
+// ExitCode conversion for a dispatched entrypoint's terminal state.
+const (
+	// ExitSuccess is the process status for an entrypoint that returned nil.
+	ExitSuccess = 0
+	// ExitFailure is the process status for an entrypoint that returned an
+	// error and whose error did not carry an explicit exit code.
+	ExitFailure = 1
+)
+
+// RunEntrypoint executes the entrypoint selected by the current process's
+// argv[0] and terminates the process with a status that reflects the
+// entrypoint's outcome. It reports whether an entrypoint was selected.
+//
+// It is the child-side counterpart of [Start] and [Run]: the child publishes a
+// single terminal exit status, so the parent can tell success (0) from failure
+// (non-zero) and can distinguish a normal exit from a signal (see
+// [Result.Signaled]) without parsing output.
+//
+// If the entrypoint returns nil, the process exits with [ExitSuccess]. If it
+// returns an error, RunEntrypoint prints it to stderr and exits with the code
+// carried by a [*ExitError], or [ExitFailure]. If no entrypoint is selected,
+// RunEntrypoint returns false and does not exit the process.
+//
+// Like [Dispatch], RunEntrypoint is meant to be called at the top of main; it
+// does not return when it reports true.
+func RunEntrypoint(ctx context.Context) bool {
+	entrypoint, err := ResolveInit()
+	if err != nil {
+		return false
+	}
+	if runErr := entrypoint.Run(ctx); runErr != nil {
+		// Match the message existing callers print when they handle Dispatch's
+		// error themselves, so moving to RunEntrypoint does not change output.
+		_, _ = fmt.Fprintln(os.Stderr, "entrypoint failed:", runErr)
+		os.Exit(exitCodeFor(runErr))
+	}
+	os.Exit(ExitSuccess)
+	return true
+}
+
+func init() {
+	// Freeze the executable identity before anything else can run, so that a
+	// later replacement of the on-disk binary cannot change the path used to
+	// re-execute ourselves or to select an entrypoint.
+	self.resolve()
+}
+
 func dispatch(ctx context.Context) (bool, error) {
-	entrypoint, ok := entrypoints[filepath.Base(os.Args[0])]
-	if !ok {
+	entrypoint, err := ResolveInit()
+	if err != nil {
+		// Not invoked as a registered entrypoint; this is a normal no-match.
 		return false, nil
 	}
-	return true, entrypoint(ctx)
+	return true, entrypoint.Run(ctx)
 }
 
 // Command returns an [*exec.Cmd] configured to re-execute the current binary,
@@ -192,19 +411,18 @@ func CommandContext(ctx context.Context, args ...string) *exec.Cmd {
 // of the running binary. This allows the on-disk binary (os.Args[0]) to be
 // replaced or deleted without affecting re-execution.
 //
-// On other platforms, it attempts to resolve os.Args[0] to an absolute path.
-// If resolution fails, it returns os.Args[0] unchanged.
+// On other platforms, it returns the path captured at startup, with os.Args[0]
+// resolved against the startup working directory and PATH and its symlink chain
+// resolved once. Because the result does not change afterwards, a later chdir,
+// PATH change, or replacement of the binary or one of its symlinks cannot
+// redirect re-execution to a different file. [Executable] returns the same
+// captured path on every platform.
 func Self() string {
-	if argv0, ok := reexecoverride.Argv0(); ok {
-		return naiveSelf(argv0)
-	}
-	if runtime.GOOS == "linux" {
-		return "/proc/self/exe"
-	}
-	return naiveSelf(os.Args[0])
+	return resolveSelf()
 }
 
-// naiveSelf is a separate function to allow testing in isolation on Linux.
+// naiveSelf is a separate function to allow testing in isolation on Linux. It
+// resolves argv0 against the live process environment.
 func naiveSelf(argv0 string) string {
 	name := argv0
 	if filepath.Base(name) == name {

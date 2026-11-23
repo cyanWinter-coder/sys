@@ -21,9 +21,47 @@ const (
 	testReExec  = "test-reexec"
 	testReExec2 = "test-reexec2"
 	testReExec3 = "test-reexec3"
+
+	testReExecExit       = "test-reexec-exit"
+	testReExecSignal     = "test-reexec-signal"
+	testReExecWait       = "test-reexec-wait"
+	testReExecIgnoreTerm = "test-reexec-ignore-term"
+	testReExecHoldStream = "test-reexec-hold-stream"
+	testReExecSleeper    = "test-reexec-sleeper"
+	testReExecExitError  = "test-reexec-exit-error"
+	testReExecOK         = "test-reexec-ok"
+
+	testReExecExitCode = 42
+)
+
+// holdStreamUse and holdStreamIgnore select which streams the hold-stream
+// child hands to the sleeper grandchild: only stdout, or both stdout and
+// stderr. The grandchild outlives the child, so those pipes do not reach EOF
+// when the child exits.
+const (
+	holdStreamUse    = "use"
+	holdStreamIgnore = "ignore"
 )
 
 var errTestEntrypointFailure = errors.New("test-reexec: simulated failure")
+
+// startSleeper starts a grandchild from the same test binary that does nothing
+// for 30 seconds. It deliberately does not go through [reexec.Command]: on
+// Linux that sets Pdeathsig, which would kill the grandchild as soon as the
+// hold-stream child exits, and the test needs the grandchild to outlive it.
+func startSleeper(stdout, stderr *os.File) error {
+	cmd := exec.Command(reexec.Self())
+	cmd.Args = []string{testReExecSleeper}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	// Reap the grandchild in a background goroutine; the reexec child exits
+	// immediately after starting it.
+	go func() { _ = cmd.Wait() }()
+	return nil
+}
 
 func init() {
 	reexec.RegisterContext(testReExec, func(context.Context) error {
@@ -42,13 +80,74 @@ func init() {
 		time.Sleep(1 * time.Second)
 		os.Exit(0)
 	})
-
-	if ok, err := reexec.Dispatch(context.Background()); ok {
-		if err != nil {
-			_, _ = fmt.Fprintln(os.Stderr, "entrypoint failed:", err)
-			os.Exit(1)
+	reexec.RegisterContext(testReExecExit, func(context.Context) error {
+		fmt.Println("child-exit")
+		os.Exit(testReExecExitCode)
+		return nil
+	})
+	reexec.RegisterContext(testReExecSignal, func(context.Context) error {
+		fmt.Println("child-signal")
+		if sig := selfTerminateSignal(); sig != nil {
+			if err := signalSelf(sig); err != nil {
+				return err
+			}
 		}
-		// Make sure we exit in case a re-exec entrypoint didn't os.Exit on its own.
+		// If the signal did not terminate us, wait to be killed.
+		time.Sleep(30 * time.Second)
+		return nil
+	})
+	reexec.RegisterContext(testReExecWait, func(ctx context.Context) error {
+		fmt.Println("child-wait")
+		// Dispatch runs entrypoints synchronously from init, where no other
+		// goroutines exist; sleep rather than park on a channel so the runtime
+		// does not report a deadlock before the parent can act.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(30 * time.Second):
+			return nil
+		}
+	})
+	reexec.RegisterContext(testReExecIgnoreTerm, func(context.Context) error {
+		fmt.Println("child-ignore-term")
+		ignoreTerminationSignals()
+		fmt.Println("child-ignoring")
+		time.Sleep(30 * time.Second)
+		return nil
+	})
+	reexec.RegisterContext(testReExecHoldStream, func(context.Context) error {
+		// The child exits immediately but leaves a grandchild holding its
+		// stdout (and optionally stderr) open, so the parent's stream copying
+		// goroutine never reaches EOF on its own.
+		mode := holdStreamUse
+		if len(os.Args) > 1 {
+			mode = os.Args[1]
+		}
+		var stderr *os.File
+		if mode == holdStreamIgnore {
+			stderr = os.Stderr
+		}
+		if err := startSleeper(os.Stdout, stderr); err != nil {
+			return err
+		}
+		fmt.Println("child-hold-stream")
+		os.Exit(0)
+		return nil
+	})
+	reexec.RegisterContext(testReExecSleeper, func(context.Context) error {
+		time.Sleep(30 * time.Second)
+		return nil
+	})
+	reexec.RegisterContext(testReExecExitError, func(context.Context) error {
+		return reexec.WithExitCode(testReExecExitCode, errors.New("coded failure"))
+	})
+	reexec.RegisterContext(testReExecOK, func(context.Context) error {
+		fmt.Println("child-ok")
+		return nil
+	})
+
+	if reexec.RunEntrypoint(context.Background()) {
+		// Unreachable: RunEntrypoint exits the process when it reports true.
 		os.Exit(0)
 	}
 }

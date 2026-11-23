@@ -134,8 +134,12 @@ func evalSymlinksInScope(path, root string) (string, error) {
 			continue
 		}
 
-		// it's a symlink, put it at the front of path
-		dest, err := os.Readlink(pFull)
+		// It's a symlink. Lstat and Readlink are two separate syscalls, so the
+		// entry can be replaced in between; Readlink then reports the new
+		// target, which may have been chosen by an attacker. Pin both to the
+		// same entry so the destination belongs to the link that was inspected
+		// (see the TOCTOU note in FollowSymlinkInScope).
+		dest, err := readlinkStable(pFull, fi)
 		if err != nil {
 			return "", err
 		}
@@ -148,6 +152,44 @@ func evalSymlinksInScope(path, root string) (string, error) {
 	// see note above on "fullP := ..." for why this is double-cleaned and
 	// what's happening here
 	return filepath.Clean(root + filepath.Clean(string(filepath.Separator)+b.String())), nil
+}
+
+// maxLinkRetries bounds how many times readlinkStable retries when the entry it
+// inspected is replaced between Lstat and Readlink.
+const maxLinkRetries = 5
+
+// readlinkStable returns the target of the symlink at name, retrying while the
+// entry is concurrently replaced so that the returned target is known to
+// belong to an entry whose identity (device and inode, or volume and file
+// index) matched what was inspected.
+func readlinkStable(name string, want os.FileInfo) (string, error) {
+	fi := want
+	for i := 0; i < maxLinkRetries; i++ {
+		dest, err := os.Readlink(name)
+		if err != nil {
+			return "", err
+		}
+		// Re-inspect after reading: if the entry is unchanged, dest describes
+		// exactly the link that was inspected.
+		now, err := os.Lstat(name)
+		if err != nil {
+			return "", err
+		}
+		if sameFile(fi, now) {
+			return dest, nil
+		}
+		fi = now
+	}
+	return "", &linkChangedError{name: name}
+}
+
+// linkChangedError reports that a symlink was repeatedly replaced while it was
+// being evaluated. It is not a temporary error: the caller should retry the
+// whole operation if it needs a stable answer.
+type linkChangedError struct{ name string }
+
+func (e *linkChangedError) Error() string {
+	return "evalSymlinksInScope: symlink " + e.name + " changed during evaluation"
 }
 
 // EvalSymlinks is a modified version of [path/filepath.EvalSymlinks] from
