@@ -20,7 +20,19 @@ func Mount(device, target, mType, options string) error {
 
 // Unmount lazily unmounts a filesystem on supported platforms, otherwise does
 // a normal unmount. If target is not a mount point, no error is returned.
+//
+// Unmount is serialized against MountAll: it never runs concurrently with a
+// batch transaction, so it can only observe a fully committed or fully
+// rolled back batch.
 func Unmount(target string) error {
+	batchMu.RLock()
+	defer batchMu.RUnlock()
+	return unmount(target)
+}
+
+// unmount is Unmount without the batch transaction lock; callers must hold
+// batchMu (or be outside any batch).
+func unmount(target string) error {
 	err := unix.Unmount(target, mntDetach)
 	if err == nil || err == unix.EINVAL {
 		// Ignore "not mounted" error here. Note the same error
